@@ -213,15 +213,6 @@
                 </div>
                 <div class="video-info">
                     <h3 class="video-title">{{ video[2] }}</h3>
-                    <div class="video-meta">
-                        {% if video[3] %}
-                            <div class="video-tags">
-                                {% for tag in video[3].split(',') %}
-                                <span class="tag">{{ tag.strip() }}</span>
-                                {% endfor %}
-                            </div>
-                        {% endif %}
-                    </div>
                 </div>
             </a>
         </div>

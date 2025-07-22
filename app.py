@@ -4,7 +4,6 @@ from datetime import datetime, timedelta
 import asyncio
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional
 import json
 import io
 import os
@@ -132,6 +131,8 @@ async def connect_client_if_needed():
         print("Telegram client initialized!")
 
 
+
+#Fetch videos from Telegram channel and store metadata in SQLite
 async def fetch_videos_from_channel():
     """Fetch videos from the Telegram channel and store metadata with thumbnail in SQLite"""
     # Ensure client is connected
@@ -144,11 +145,19 @@ async def fetch_videos_from_channel():
         channel = await client.get_entity(CHANNEL_USERNAME)
         videos = []
         messages = []
-        async for msg in client.iter_messages(channel):
+        processed_group_ids = set()  # Track processed groups to avoid duplicates
+        
+        cursor.execute("SELECT MAX(msg_id) FROM med")
+        last_msg_id = cursor.fetchone()[0] or 0
+        
+        async for msg in client.iter_messages(channel, min_id=last_msg_id):
+        # async for msg in client.iter_messages(channel):
             messages.append(msg)
             print(f'Fetched {len(messages)} messages from tg')
         
         print(f'Starting message processing...')
+        
+        # Process all messages first
         for msg in messages:
             print(f'Processing message {msg.id}')
             
@@ -156,43 +165,28 @@ async def fetch_videos_from_channel():
             if not msg.media:
                 continue
 
-            # Initialize for grouped media
-            video_doc = None
-            image_msg = None
-            video_msg = None
-            json_data = {"media_name": None, "tags": None}
-
             # Handle grouped media
             if hasattr(msg, 'grouped_id') and msg.grouped_id:
+                # Skip if we've already processed this group
+                if msg.grouped_id in processed_group_ids:
+                    continue
+                
+                processed_group_ids.add(msg.grouped_id)
+                
                 group_messages = [m for m in messages if
                                   hasattr(m, 'grouped_id') and m.grouped_id == msg.grouped_id]
 
                 if msg not in group_messages:
                     group_messages.append(msg)
 
-                # Find the first image and video in the group
-                for group_msg in group_messages:
-                    if group_msg.message:
-                        try:
-                            possible_json = group_msg.message.strip()
-                            if possible_json.startswith('{') and possible_json.endswith('}'):
-                                parsed_data = json.loads(possible_json)
-                                if 'media_name' in parsed_data or 'tags' in parsed_data:
-                                    json_data = parsed_data
-                        except json.JSONDecodeError:
-                            pass
-                    if group_msg.photo:
-                        image_msg = group_msg
-                    elif group_msg.media and hasattr(group_msg.media, 'document'):
-                        doc = group_msg.media.document
-                        if doc.mime_type.startswith('video/'):
-                            video_doc = doc
-                            video_msg = group_msg
+                # Process the entire group together
+                await process_group_messages(group_messages, cursor, conn, videos, messages)
 
             # Handle single video message
             elif hasattr(msg.media, 'document') and msg.media.document.mime_type.startswith('video/'):
                 video_doc = msg.media.document
                 video_msg = msg
+                json_data = {"media_name": None, "tags": None}
 
                 # Check for JSON in the message text
                 if msg.message:
@@ -205,92 +199,16 @@ async def fetch_videos_from_channel():
                     except json.JSONDecodeError:
                         pass
 
-            # Skip if no video found
-            if not video_doc or not video_msg:
-                continue
-
-            # Get video attributes
-            video_attr = next((attr for attr in video_doc.attributes
-                               if isinstance(attr, DocumentAttributeVideo)), None)
-
-            # Get video ID
-            video_id = video_msg.id
-            
-            # Check if video already exists in database
-            cursor.execute("SELECT id FROM med WHERE msg_id = ?", (video_id,))
-            if cursor.fetchone():
-                print(f"Video {video_id} already in database, skipping")
-                continue
-            
-            try:
-                video_name = video_msg.document.attributes[1].file_name
-                words = re.split(r'[^a-zA-Z0-9]+', video_name)
-                cleaned = [word for word in words if word]
-                tags_from_title = ', '.join(cleaned)
-            except:
-                continue
-
-            # Prepare video info for database
-            title = json_data.get('media_name', None) or f'{video_name}'
-            tags = json_data.get('tags', "") or f'{tags_from_title}'
-            
-            video_info = {
-                'msg_id': video_id,
-                'file_size': video_doc.size,
-                'mime_type': video_doc.mime_type,
-                'duration': video_attr.duration if video_attr else 0,
-                'width': video_attr.w if video_attr else 0,
-                'height': video_attr.h if video_attr else 0,
-                'title': title,
-                'tags': tags
-            }
-
-            # Download thumbnail as binary data
-            thumbnail_data = None
-            if video_info.get('duration') > 300:
-                try:
-                    if image_msg:
-                        # Use BytesIO to capture the image data directly
-                        thumbnail_buffer = io.BytesIO()
-                        await client.download_media(image_msg, thumbnail_buffer)
-                        thumbnail_data = thumbnail_buffer.getvalue()
-
-                    elif video_doc.thumbs:
-                        # Fallback to video's built-in thumbnail
-                        best_thumb = max(video_doc.thumbs, key=lambda t: getattr(t, 'w', 0) * getattr(t, 'h', 0))
-                        thumbnail_buffer = io.BytesIO()
-                        await client.download_media(
-                            message=video_msg,
-                            file=thumbnail_buffer,
-                            thumb=video_doc.thumbs.index(best_thumb)
-                        )
-                        thumbnail_data = thumbnail_buffer.getvalue()
-                except Exception as e:
-                    print(f"Error downloading thumbnail for video {video_id}: {e}")
-
-            # Insert data into SQLite
-            try:
-                cursor.execute('''
-                INSERT INTO med (msg_id, title, tags, file_size, mime_type, duration, width, height, thumbnail)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    video_info['msg_id'],
-                    video_info['title'],
-                    video_info['tags'],
-                    video_info['file_size'],
-                    video_info['mime_type'],
-                    video_info['duration'],
-                    video_info['width'],
-                    video_info['height'],
-                    thumbnail_data
-                ))
-                conn.commit()
-                print(f'Inserted {title} to db')
-                # Add to return list (without the binary data for cleaner output)
-                videos.append(video_info)
-                # time.sleep(10)
-            except sqlite3.Error as e:
-                print(f"SQLite error: {e}")
+                # Check for adjacent thumbnail for single video messages
+                adjacent_thumbnail = await find_adjacent_thumbnail(video_msg, messages, json_data)
+                
+                await process_single_video(
+                    video_doc, video_msg, json_data, None, 
+                    cursor, conn, videos, custom_thumbnail=adjacent_thumbnail
+                )
+        
+        # Remove duplicates after processing all messages
+        await remove_duplicate_videos(cursor, conn)
 
     except Exception as e:
         print(f"Error fetching videos: {e}")
@@ -298,6 +216,430 @@ async def fetch_videos_from_channel():
         conn.close()
 
     return videos
+
+
+async def process_group_messages(group_messages, cursor, conn, videos, all_messages=None):
+    """Process all messages in a group together"""
+    video_docs = []
+    image_msgs = []
+    video_msgs = []
+    json_data = {"media_name": None, "tags": None}
+    
+    # Collect all media from the group
+    for group_msg in group_messages:
+        if group_msg.message:
+            try:
+                possible_json = group_msg.message.strip()
+                if possible_json.startswith('{') and possible_json.endswith('}'):
+                    parsed_data = json.loads(possible_json)
+                    if 'media_name' in parsed_data or 'tags' in parsed_data:
+                        json_data = parsed_data
+            except json.JSONDecodeError:
+                pass
+        
+        if group_msg.photo:
+            image_msgs.append(group_msg)
+        elif group_msg.media and hasattr(group_msg.media, 'document'):
+            doc = group_msg.media.document
+            if doc.mime_type.startswith('video/'):
+                video_docs.append(doc)
+                video_msgs.append(group_msg)
+    
+    # Apply group processing logic
+    if len(group_messages) == 1 and len(video_msgs) == 1:
+        # Single group message with video - check adjacent messages for images
+        video_doc = video_docs[0]
+        video_msg = video_msgs[0]
+        
+        adjacent_thumbnail = await find_adjacent_thumbnail(video_msg, all_messages, json_data)
+        
+        await process_single_video(
+            video_doc, video_msg, json_data, None, 
+            cursor, conn, videos, custom_thumbnail=adjacent_thumbnail
+        )
+    
+    elif len(group_messages) > 2:
+        # More than 2 media files
+        if len(image_msgs) == 1 and len(video_msgs) >= 1:
+            # One photo and rest are videos - use same photo as thumbnail for all videos
+            shared_thumbnail = await get_thumbnail_data(image_msgs[0])
+            for i, (video_doc, video_msg) in enumerate(zip(video_docs, video_msgs)):
+                await process_single_video(
+                    video_doc, video_msg, json_data, None, 
+                    cursor, conn, videos, group_index=i+1, total_in_group=len(video_docs),
+                    custom_thumbnail=shared_thumbnail
+                )
+        else:
+            # For any other condition, fetch thumbnail for each individual video
+            for i, (video_doc, video_msg) in enumerate(zip(video_docs, video_msgs)):
+                await process_single_video(
+                    video_doc, video_msg, json_data, None, 
+                    cursor, conn, videos, group_index=i+1, total_in_group=len(video_docs)
+                )
+    
+    elif len(group_messages) == 2:
+        # Exactly 2 media files
+        if len(image_msgs) == 1 and len(video_msgs) == 1:
+            # One photo and one video - use photo as thumbnail for video
+            thumbnail_data = await get_thumbnail_data(image_msgs[0])
+            await process_single_video(
+                video_docs[0], video_msgs[0], json_data, None, 
+                cursor, conn, videos, custom_thumbnail=thumbnail_data
+            )
+        elif len(video_msgs) == 2:
+            # Both are videos
+            video1_doc, video1_msg = video_docs[0], video_msgs[0]
+            video2_doc, video2_msg = video_docs[1], video_msgs[1]
+            
+            # Get durations
+            video1_attr = next((attr for attr in video1_doc.attributes
+                               if isinstance(attr, DocumentAttributeVideo)), None)
+            video2_attr = next((attr for attr in video2_doc.attributes
+                               if isinstance(attr, DocumentAttributeVideo)), None)
+            
+            duration1 = video1_attr.duration if video1_attr else 0
+            duration2 = video2_attr.duration if video2_attr else 0
+            
+            # Check if one video is less than 30 seconds and other is more than 5 minutes
+            if ((duration1 < 30 and duration2 > 300) or (duration2 < 30 and duration1 > 300)):
+                if duration1 < 30 and duration2 > 300:
+                    # Use thumbnail of short video for the long video
+                    short_thumbnail = await get_video_thumbnail(video1_doc, video1_msg)
+                    await process_single_video(
+                        video2_doc, video2_msg, json_data, None, 
+                        cursor, conn, videos, custom_thumbnail=short_thumbnail
+                    )
+                    # Don't insert the short video
+                else:
+                    # Use thumbnail of short video for the long video
+                    short_thumbnail = await get_video_thumbnail(video2_doc, video2_msg)
+                    await process_single_video(
+                        video1_doc, video1_msg, json_data, None, 
+                        cursor, conn, videos, custom_thumbnail=short_thumbnail
+                    )
+                    # Don't insert the short video
+            else:
+                # For any other condition, fetch thumbnail for both videos separately
+                await process_single_video(
+                    video1_doc, video1_msg, json_data, None, 
+                    cursor, conn, videos, group_index=1, total_in_group=2
+                )
+                await process_single_video(
+                    video2_doc, video2_msg, json_data, None, 
+                    cursor, conn, videos, group_index=2, total_in_group=2
+                )
+        else:
+            # Process all videos normally
+            for i, (video_doc, video_msg) in enumerate(zip(video_docs, video_msgs)):
+                await process_single_video(
+                    video_doc, video_msg, json_data, None, 
+                    cursor, conn, videos, group_index=i+1, total_in_group=len(video_docs)
+                )
+    else:
+        # Single media or other cases
+        for i, (video_doc, video_msg) in enumerate(zip(video_docs, video_msgs)):
+            await process_single_video(
+                video_doc, video_msg, json_data, None, 
+                cursor, conn, videos, group_index=i+1, total_in_group=len(video_docs)
+            )
+
+
+async def find_adjacent_thumbnail(video_msg, all_messages, json_data):
+    """Find thumbnail from adjacent messages for single group video"""
+    if not all_messages:
+        return None
+    
+    # Find the index of the video message
+    video_msg_index = -1
+    for i, msg in enumerate(all_messages):
+        if msg.id == video_msg.id:
+            video_msg_index = i
+            break
+    
+    if video_msg_index == -1:
+        return None
+    
+    # Check previous and next messages for single image
+    prev_msg = all_messages[video_msg_index - 1] if video_msg_index > 0 else None
+    next_msg = all_messages[video_msg_index + 1] if video_msg_index < len(all_messages) - 1 else None
+    
+    # Helper function to check if message contains only an image
+    def is_single_image_message(msg):
+        if not msg or not msg.photo:
+            return False
+        # Check if it's not part of a group or has other media
+        if hasattr(msg, 'grouped_id') and msg.grouped_id:
+            return False
+        return True
+    
+    prev_is_image = is_single_image_message(prev_msg)
+    next_is_image = is_single_image_message(next_msg)
+    
+    # If no adjacent image messages found
+    if not prev_is_image and not next_is_image:
+        return None
+    
+    # If only one adjacent image message
+    if prev_is_image and not next_is_image:
+        return await get_thumbnail_data(prev_msg)
+    elif next_is_image and not prev_is_image:
+        return await get_thumbnail_data(next_msg)
+    
+    # If both previous and next contain single image messages
+    if prev_is_image and next_is_image:
+        # Get first word from video message text
+        video_text = video_msg.message or ""
+        
+        # Try to parse JSON first to get media_name
+        first_word = None
+        try:
+            if video_text.strip().startswith('{') and video_text.strip().endswith('}'):
+                parsed_data = json.loads(video_text.strip())
+                media_name = parsed_data.get('media_name', '')
+                if media_name:
+                    # Get first word from media_name
+                    first_word = extract_first_word(media_name)
+        except json.JSONDecodeError:
+            pass
+        
+        # If no first word from JSON, get from raw text
+        if not first_word:
+            first_word = extract_first_word(video_text)
+        
+        if first_word:
+            # Check if the word matches in previous message text
+            prev_text = prev_msg.message or ""
+            next_text = next_msg.message or ""
+            
+            if word_matches_in_text(first_word, prev_text):
+                return await get_thumbnail_data(prev_msg)
+            elif word_matches_in_text(first_word, next_text):
+                return await get_thumbnail_data(next_msg)
+        
+        # If no match found, use previous message image
+        return await get_thumbnail_data(prev_msg)
+    
+    return None
+
+
+async def get_thumbnail_data(image_msg):
+    """Get thumbnail data from an image message"""
+    try:
+        thumbnail_buffer = io.BytesIO()
+        await client.download_media(image_msg, thumbnail_buffer)
+        return thumbnail_buffer.getvalue()
+    except Exception as e:
+        print(f"Error downloading thumbnail from image: {e}")
+        os._exit(1)
+    
+
+def extract_first_word(text):
+    """Extract the first meaningful word from text in any language"""
+    if not text:
+        return None
+    
+    # Remove JSON formatting and clean the text
+    text = text.strip()
+    
+    # Remove common punctuation and split by various separators
+    import string
+    # Extended punctuation for various languages
+    punctuation = string.punctuation + '，。！？；：「」『』（）［］｛｝〈〉《》【】〔〕'
+    
+    # Replace punctuation with spaces
+    for char in punctuation:
+        text = text.replace(char, ' ')
+    
+    # Split by whitespace and get first non-empty word
+    words = text.split()
+    for word in words:
+        word = word.strip()
+        if word and len(word) > 1:  # Ignore single characters
+            return word.lower()
+    
+    return None
+
+
+def word_matches_in_text(word, text):
+    """Check if word matches in text (case-insensitive, supports multiple languages)"""
+    if not word or not text:
+        return False
+    
+    # Convert to lowercase for comparison
+    word_lower = word.lower()
+    text_lower = text.lower()
+    
+    # Simple contains check
+    if word_lower in text_lower:
+        return True
+    
+    # Check as separate word (with word boundaries)
+    import re
+    
+    # Create pattern that works with various languages
+    # Use word boundaries where possible, fallback to space/punctuation boundaries
+    patterns = [
+        rf'\b{re.escape(word_lower)}\b',  # Standard word boundaries
+        rf'(?:^|\s){re.escape(word_lower)}(?:\s|$)',  # Space boundaries
+        rf'(?:^|[^\w]){re.escape(word_lower)}(?:[^\w]|$)',  # Non-word char boundaries
+    ]
+    
+    for pattern in patterns:
+        try:
+            if re.search(pattern, text_lower, re.IGNORECASE | re.UNICODE):
+                return True
+        except re.error:
+            continue
+    
+    return False
+
+
+async def get_video_thumbnail(video_doc, video_msg):
+    """Get thumbnail data from a video"""
+    try:
+        if video_doc.thumbs:
+            best_thumb = max(video_doc.thumbs, key=lambda t: getattr(t, 'w', 0) * getattr(t, 'h', 0))
+            thumbnail_buffer = io.BytesIO()
+            await client.download_media(
+                message=video_msg,
+                file=thumbnail_buffer,
+                thumb=video_doc.thumbs.index(best_thumb)
+            )
+            return thumbnail_buffer.getvalue()
+    except Exception as e:
+        print(f"Error downloading video thumbnail: {e}")
+    return None
+
+
+async def process_single_video(video_doc, video_msg, json_data, image_msg, cursor, conn, videos, 
+                              group_index=None, total_in_group=None, custom_thumbnail=None):
+    """Process a single video and insert into database"""
+    
+    # Get video attributes
+    video_attr = next((attr for attr in video_doc.attributes
+                       if isinstance(attr, DocumentAttributeVideo)), None)
+
+    # Get video ID
+    video_id = video_msg.id
+    
+    # Check if video already exists in database
+    cursor.execute("SELECT id FROM med WHERE msg_id = ?", (video_id,))
+    if cursor.fetchone():
+        print(f"Video {video_id} already in database, skipping")
+        return
+    
+    try:
+        video_name = video_msg.document.attributes[1].file_name
+        words = re.split(r'[^a-zA-Z0-9]+', video_name)
+        cleaned = [word for word in words if word]
+        tags_from_title = ', '.join(cleaned)
+    except:
+        return
+
+    # Get duration for thumbnail logic
+    duration = video_attr.duration if video_attr else 0
+
+    # Prepare video info for database
+    base_title = json_data.get('media_name', None) or f'{video_name}'
+    
+    # Add group index to title if it's part of a group with multiple videos
+    if group_index and total_in_group > 1:
+        title = f"{base_title} (Part {group_index}/{total_in_group})"
+    else:
+        title = base_title
+        
+    tags = json_data.get('tags', "") or f'{tags_from_title}'
+    
+    video_info = {
+        'msg_id': video_id,
+        'file_size': video_doc.size,
+        'mime_type': video_doc.mime_type,
+        'duration': duration,
+        'width': video_attr.w if video_attr else 0,
+        'height': video_attr.h if video_attr else 0,
+        'title': title,
+        'tags': tags
+    }
+    
+    # Check for repeated messages in database
+    cursor.execute("SELECT id FROM med WHERE title = ? and file_size = ?", (title, video_doc.size))
+    if cursor.fetchone():
+        print(f"Video {video_id} already in database, skipping")
+        return
+
+    # Download thumbnail as binary data
+    thumbnail_data = None
+    
+    # Only download thumbnail for videos longer than 3 minutes (180 seconds)
+    if duration >= 180:
+        if custom_thumbnail:
+            # Use provided custom thumbnail
+            thumbnail_data = custom_thumbnail
+        else:
+            # Download thumbnail normally
+            try:
+                if image_msg:
+                    # Use BytesIO to capture the image data directly
+                    thumbnail_buffer = io.BytesIO()
+                    await client.download_media(image_msg, thumbnail_buffer)
+                    thumbnail_data = thumbnail_buffer.getvalue()
+
+                elif video_doc.thumbs:
+                    # Fallback to video's built-in thumbnail
+                    thumbnail_data = await get_video_thumbnail(video_doc, video_msg)
+            except Exception as e:
+                print(f"Error downloading thumbnail for video {video_id}: {e}")
+
+    # Insert data into SQLite
+    try:
+        cursor.execute('''
+        INSERT INTO med (msg_id, title, tags, file_size, mime_type, duration, width, height, thumbnail)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            video_info['msg_id'],
+            video_info['title'],
+            video_info['tags'],
+            video_info['file_size'],
+            video_info['mime_type'],
+            video_info['duration'],
+            video_info['width'],
+            video_info['height'],
+            thumbnail_data
+        ))
+        conn.commit()
+        print(f'Inserted {title} to db')
+        # Add to return list (without the binary data for cleaner output)
+        videos.append(video_info)
+        # time.sleep(10)
+    except sqlite3.Error as e:
+        print(f"SQLite error: {e}")
+
+
+async def remove_duplicate_videos(cursor, conn):
+    """Remove duplicate videos based on media name and file size"""
+    print("Removing duplicate videos...")
+    
+    # Find duplicates based on title and file_size
+    cursor.execute('''
+        SELECT title, file_size, COUNT(*) as count, GROUP_CONCAT(id) as ids
+        FROM med 
+        GROUP BY title, file_size 
+        HAVING COUNT(*) > 1
+    ''')
+    
+    duplicates = cursor.fetchall()
+    
+    for title, file_size, count, ids_str in duplicates:
+        ids = ids_str.split(',')
+        # Keep the first record (lowest ID) and delete the rest
+        ids_to_delete = ids[1:]  # Skip the first ID
+        
+        for id_to_delete in ids_to_delete:
+            cursor.execute("DELETE FROM med WHERE id = ?", (id_to_delete,))
+            print(f"Deleted duplicate video with ID {id_to_delete} (title: {title}, size: {file_size})")
+    
+    conn.commit()
+    print(f"Removed {sum(len(ids.split(',')) - 1 for _, _, _, ids in duplicates)} duplicate videos")
 
 
 def schedule_fetch(interval_seconds=86400):  # Default 2 days
@@ -380,7 +722,7 @@ def home():
     cursor = conn.cursor()
     
     # Get total count of videos
-    cursor.execute("SELECT COUNT(*) FROM med WHERE duration > 300")
+    cursor.execute("SELECT COUNT(*) FROM med WHERE duration > 180")
     total_videos = cursor.fetchone()[0]
     
     # Calculate total pages
@@ -393,7 +735,7 @@ def home():
         page = total_pages
     
     # Get all videos to shuffle
-    cursor.execute("SELECT id, msg_id, title, tags, duration FROM med WHERE duration > 300 ORDER BY id DESC")
+    cursor.execute("SELECT id, msg_id, title, tags, duration FROM med WHERE duration > 180 ORDER BY id DESC")
     all_videos = cursor.fetchall()
     
     # Use session to store shuffled video IDs
@@ -921,11 +1263,11 @@ def upload_video():
 def shorts():
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
-    # Select only videos less than 5 minutes (300 seconds)
+    # Select only videos less than 3 minutes (180 seconds)
     cursor.execute("""
         SELECT id, msg_id, title, tags, duration, mime_type
         FROM med 
-        WHERE duration < 300 
+        WHERE duration < 180 
         ORDER BY id DESC
     """)
     short_videos = cursor.fetchall()

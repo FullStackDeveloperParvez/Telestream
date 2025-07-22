@@ -624,28 +624,8 @@
         <h2>Share Video</h2>
         <p>Copy the link below or share directly to social media:</p>
         <div class="share-link-container">
-            <input type="text" id="shareLinkInput" value="{{ request.url }}" readonly>
+            <input type="text" id="shareLinkInput" value="https://t.me/c/2049709147/{{ video[1] }}" readonly>
             <button id="copyLinkBtn"><i class="fas fa-copy"></i> Copy</button>
-        </div>
-        <div class="share-options">
-            <a href="https://www.facebook.com/sharer/sharer.php?u={{ request.url|urlencode }}" target="_blank" class="share-option">
-                <i class="fab fa-facebook"></i> Facebook
-            </a>
-            <a href="https://twitter.com/intent/tweet?url={{ request.url|urlencode }}&text={{ video[2]|urlencode }}" target="_blank" class="share-option">
-                <i class="fab fa-twitter"></i> Twitter
-            </a>
-            <a href="https://www.linkedin.com/shareArticle?mini=true&url={{ request.url|urlencode }}&title={{ video[2]|urlencode }}" target="_blank" class="share-option">
-                <i class="fab fa-linkedin"></i> LinkedIn
-            </a>
-            <a href="mailto:?subject={{ video[2]|urlencode }}&body=Check out this video: {{ request.url|urlencode }}" target="_blank" class="share-option">
-                <i class="fas fa-envelope"></i> Email
-            </a>
-             <a href="https://t.me/share/url?url={{ request.url|urlencode }}&text={{ video[2]|urlencode }}" target="_blank" class="share-option">
-                <i class="fab fa-telegram-plane"></i> Telegram
-            </a>
-             <a href="https://wa.me/?text={{ video[2]|urlencode }}%20{{ request.url|urlencode }}" target="_blank" class="share-option">
-                <i class="fab fa-whatsapp"></i> WhatsApp
-            </a>
         </div>
     </div>
 </div>
