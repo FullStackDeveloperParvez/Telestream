@@ -1,6 +1,0 @@
-/.vs/
-/venv/
-.env
-database.db
-video_player_session.session
-video_player_session.session-journal
