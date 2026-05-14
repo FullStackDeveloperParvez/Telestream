@@ -50,6 +50,7 @@ def init_app():
 
     # Create event loop and executor
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     executor = ThreadPoolExecutor(max_workers=5)
 
     # Initialize Telethon client
@@ -737,50 +738,19 @@ def home():
     # Get all videos to shuffle
     cursor.execute("SELECT id, msg_id, title, tags, duration FROM med WHERE duration > 180 ORDER BY id DESC")
     all_videos = cursor.fetchall()
-    
-    # Use session to store shuffled video IDs
-    session_key = f'shuffled_videos_{refresh}'
-    
-    # Check if we should force a new shuffle
-    if refresh or session_key not in session:
-        # Shuffle the videos
-        random.shuffle(all_videos)
-        # Store just the IDs to minimize session size
-        video_ids = [video[0] for video in all_videos]
-        session[session_key] = video_ids
-    
-    # Get the video IDs for the current shuffled order
-    shuffled_ids = session.get(session_key, [])
-    
-    # Prepare the query to get the specific videos in the shuffled order for this page
-    if shuffled_ids:
-        # Calculate the slice for this page
-        start_idx = (page - 1) * per_page
-        end_idx = min(start_idx + per_page, len(shuffled_ids))
-        
-        # Get the subset of IDs for this page
-        page_ids = shuffled_ids[start_idx:end_idx]
-        
-        if page_ids:
-            # Convert list to comma-separated string for SQL IN clause
-            ids_str = ','.join('?' for _ in page_ids)
-            
-            # Get the actual videos in the shuffled order
-            cursor.execute(f"""
-                SELECT id, msg_id, title, tags, duration 
-                FROM med 
-                WHERE id IN ({ids_str})
-                ORDER BY CASE id {' '.join([f'WHEN ? THEN {i}' for i in range(len(page_ids))])} END
-            """, page_ids + page_ids)
-            
-            videos = cursor.fetchall()
-        else:
-            videos = []
-    else:
-        videos = []
-    
     conn.close()
+    
+    # Store only a single int in session — no cookie overflow
+    if refresh or 'shuffle_seed' not in session:
+        session['shuffle_seed'] = random.randint(0, 2**31)
 
+    # Reproduce the same shuffle consistently using the seed
+    rng = random.Random(session['shuffle_seed'])
+    rng.shuffle(all_videos)
+
+    start_idx = (page - 1) * per_page
+    videos = all_videos[start_idx : start_idx + per_page]
+    
     return render_template('home.html', 
                            username=session.get('username'), 
                            videos=videos, 
